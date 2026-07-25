@@ -1,0 +1,42 @@
+name: Shinesty Daily Sync
+
+# Runs 4x/day: ~8am, 11am, 2pm, 5pm US Eastern.
+# GitHub Actions cron is UTC-only, so times below are fixed UTC and will
+# drift by 1 hour across the DST changeover (mid-March / early November).
+# Adjust the four cron lines if your team is not on US Eastern time.
+on:
+  schedule:
+    - cron: "0 12 * * *"   # 8:00 AM ET  (EDT, UTC-4)
+    - cron: "0 15 * * *"   # 11:00 AM ET
+    - cron: "0 18 * * *"   # 2:00 PM ET
+    - cron: "0 21 * * *"   # 5:00 PM ET
+  workflow_dispatch: {}     # lets you trigger a run manually from the Actions tab
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests openpyxl python-docx xlrd
+
+      - name: Run sync
+        env:
+          MONDAY_API_KEY: ${{ secrets.MONDAY_API_KEY }}
+          NS_ACCOUNT_ID: ${{ secrets.NS_ACCOUNT_ID }}
+          NS_CONSUMER_KEY: ${{ secrets.NS_CONSUMER_KEY }}
+          NS_CONSUMER_SECRET: ${{ secrets.NS_CONSUMER_SECRET }}
+          NS_TOKEN_ID: ${{ secrets.NS_TOKEN_ID }}
+          NS_TOKEN_SECRET: ${{ secrets.NS_TOKEN_SECRET }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          NS_RESTLET_URL: ${{ secrets.NS_RESTLET_URL }}
+        run: python shinesty_daily_sync.py
