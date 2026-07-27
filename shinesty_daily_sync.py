@@ -32,7 +32,7 @@ Manager, etc. NEVER commit real values to a repo or plaintext file):
   SLACK_BOT_TOKEN       — Slack bot token
   NS_RESTLET_URL        — (optional) NetSuite RESTlet URL for file uploads
 
-Status label IDs (confirmed 2026-04-07): Done=1, Error=2, Docs Uploaded=4, Missing Resale Cert=8
+Status label IDs (confirmed 2026-04-07): Done=1, Error=2, Docs Uploaded=4
 """
 
 import os
@@ -442,6 +442,23 @@ def _convert_heic_to_jpeg(file_bytes: bytes) -> tuple:
     return out.getvalue(), "jpg"
 
 
+def normalize_heic_file(file_bytes: bytes, ext: str, filename: str) -> tuple:
+    """If the file is HEIC/HEIF (iPhone photo format), convert it to JPEG so
+    both the copy sent to Claude AND the copy stored in NetSuite are a normal,
+    viewable image format. Returns (file_bytes, ext, filename) — unchanged if
+    not HEIC/HEIF, or if conversion fails (falls back to original file)."""
+    if ext not in ("heic", "heif"):
+        return file_bytes, ext, filename
+    try:
+        converted_bytes, new_ext = _convert_heic_to_jpeg(file_bytes)
+        new_filename = re.sub(r"\.(heic|heif)$", "", filename, flags=re.IGNORECASE) + f".{new_ext}"
+        log.info(f"      Converted {filename} → {new_filename} for NetSuite/Claude compatibility")
+        return converted_bytes, new_ext, new_filename
+    except Exception as e:
+        log.warning(f"      HEIC conversion failed ({e}) — keeping original file as-is")
+        return file_bytes, ext, filename
+
+
 def _file_block(file_bytes: bytes, ext: str) -> dict:
     if ext in ("heic", "heif"):
         try:
@@ -613,6 +630,7 @@ def process_item(item: dict) -> None:
             try:
                 log.info(f"  [1] Resale cert: {f['name']}")
                 fb = download_file(f["url"])
+                fb, f["ext"], f["name"] = normalize_heic_file(fb, f["ext"], f["name"])
                 extracted = claude_extract_resale_cert(fb, f["ext"])
                 log.info(f"      Document type: {extracted.get('document_type')} | valid: {extracted.get('is_valid')}")
 
@@ -659,6 +677,7 @@ def process_item(item: dict) -> None:
             try:
                 log.info(f"  [2] Signature: {f['name']}")
                 fb = download_file(f["url"])
+                fb, f["ext"], f["name"] = normalize_heic_file(fb, f["ext"], f["name"])
                 ct = MEDIA_TYPES.get(f["ext"], "application/octet-stream")
                 ns_upload_file_via_restlet(customer_id, f["name"], fb, ct, "signature")
             except Exception as e:
@@ -674,6 +693,7 @@ def process_item(item: dict) -> None:
             try:
                 log.info(f"  [3] Multi-address: {f['name']}")
                 fb        = download_file(f["url"])
+                fb, f["ext"], f["name"] = normalize_heic_file(fb, f["ext"], f["name"])
                 addresses = claude_extract_addresses(fb, f["ext"])
                 log.info(f"      Extracted {len(addresses)} address(es)")
                 ns_add_customer_addresses(customer_id, addresses)
