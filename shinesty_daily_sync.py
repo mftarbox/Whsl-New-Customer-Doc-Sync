@@ -67,9 +67,10 @@ SLACK_CHANNEL_ID    = "C0ARSBBPGP7"   # #whsl_multiple_address_alert
 SLACK_ALEX_USER_ID  = "U02H69DED2N"   # Alex — Wholesale Sales Ops Coordinator
 
 # Monday status label IDs
-STATUS_DONE           = 1   # "Done" — NS record created; triggers this script
-STATUS_ERROR          = 2   # "Error"
-STATUS_DOCS_UPLOADED  = 4   # "Docs Uploaded" — label ID 4, confirmed from board settings
+STATUS_DONE                = 1   # "Done" — NS record created; triggers this script
+STATUS_ERROR               = 2   # "Error"
+STATUS_DOCS_UPLOADED       = 4   # "Docs Uploaded" — label ID 4, confirmed from board settings
+STATUS_MISSING_RESALE_CERT = 8   # "Missing Resale Cert" — no cert uploaded, or uploaded doc isn't a valid resale cert
 
 # Monday column IDs (from board inspection)
 COL_STATUS       = "status"
@@ -571,6 +572,7 @@ def process_item(item: dict) -> None:
     item_id      = item["id"]
     item_name    = item["name"]
     errors       = []
+    missing_cert_reasons = []
 
     log.info(f"── [{item_id}] {item_name}")
 
@@ -597,9 +599,9 @@ def process_item(item: dict) -> None:
 
                 if not extracted.get("is_valid"):
                     reject_reason = extracted.get("reject_reason") or f"Unacceptable document type: {extracted.get('document_type', 'unknown')}"
-                    msg = f"Step 1 wrong document in Resale Certificate field (\"{f['name']}\"): {reject_reason}"
+                    msg = f"\"{f['name']}\" is not a valid resale certificate: {reject_reason}"
                     log.error(f"      REJECTED: {reject_reason}")
-                    errors.append(msg)
+                    missing_cert_reasons.append(msg)
                     continue
 
                 ns_fields = {}
@@ -630,6 +632,7 @@ def process_item(item: dict) -> None:
                 errors.append(msg)
     else:
         log.info("  [1] No resale certificate — skipping")
+        missing_cert_reasons.append("No resale certificate has been uploaded to this item.")
 
     sig_files = get_file_urls(item, COL_SIGNATURE)
     if sig_files:
@@ -679,13 +682,26 @@ def process_item(item: dict) -> None:
         log.info("  [3] No multiple address file — skipping")
 
     if errors:
-        set_monday_status(item_id, STATUS_ERROR)
-        post_monday_update(
-            item_id,
+        note = (
             f"⚠️ Sync errors ({datetime.now().strftime('%Y-%m-%d')}):\n"
             + "\n".join(f"• {e}" for e in errors)
         )
+        if missing_cert_reasons:
+            note += "\n\nAlso flagged:\n" + "\n".join(f"• {m}" for m in missing_cert_reasons)
+        set_monday_status(item_id, STATUS_ERROR)
+        post_monday_update(item_id, note)
         log.warning(f"  → ERROR ({len(errors)} issue(s))")
+    elif missing_cert_reasons:
+        set_monday_status(item_id, STATUS_MISSING_RESALE_CERT)
+        post_monday_update(
+            item_id,
+            f"📋 Missing Resale Cert ({datetime.now().strftime('%Y-%m-%d')}):\n"
+            + "\n".join(f"• {m}" for m in missing_cert_reasons)
+            + "\n\nPlease upload a valid resale certificate to this item's Resale Certificate field, "
+              "then change the status back to \"Done\" — this will automatically re-trigger the sync "
+              "and update the customer record in NetSuite."
+        )
+        log.warning(f"  → MISSING RESALE CERT ({len(missing_cert_reasons)} issue(s))")
     else:
         set_monday_status(item_id, STATUS_DOCS_UPLOADED)
         log.info("  → DOCS UPLOADED ✓")
