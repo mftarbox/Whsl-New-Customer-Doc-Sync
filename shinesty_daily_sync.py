@@ -453,7 +453,8 @@ def _claude(messages: list, max_tokens: int = 512) -> str:
             time.sleep(wait)
             continue
         resp.raise_for_status()
-        text = resp.json()["content"][0]["text"].strip()
+        content_blocks = resp.json()["content"]
+        text = next(b["text"] for b in content_blocks if b.get("type") == "text").strip()
         return re.sub(r"```json|```", "", text).strip()
     raise RuntimeError("Claude API rate limit: max retries exceeded after 4 attempts (~5 min total wait)")
 
