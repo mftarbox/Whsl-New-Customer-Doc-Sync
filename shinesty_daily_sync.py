@@ -444,7 +444,7 @@ def _claude(messages: list, max_tokens: int = 512) -> str:
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             },
-            json={"model": "claude-sonnet-4-6-20260217", "max_tokens": max_tokens, "messages": messages},
+            json={"model": "claude-sonnet-5", "max_tokens": max_tokens, "messages": messages},
             timeout=90,
         )
         if resp.status_code == 429:
