@@ -14,10 +14,12 @@ What it does, per qualifying row:
                          → upload file to NS File Cabinet
   2. Signature file      → upload to NS File Cabinet
   3. Multiple Address    → extract addresses → add to NS customer record
-                         → Slack alert to #whsl_multiple_address_alert @Alex
+                         → upload file to NS File Cabinet
+                         → Slack alert (with file attached) to #whsl_multiple_address_alert
   4. Status update:
        All steps OK  → Import NetSuite Status = "Docs Uploaded"
        Any error     → Import NetSuite Status = "Error" + post update on item
+       Missing/invalid resale cert → Import NetSuite Status = "Missing Resale Cert"
 
 Required environment variables (set these as secrets in whatever scheduler
 runs this — GitHub Actions secrets, systemd EnvironmentFile, AWS Secrets
@@ -29,10 +31,10 @@ Manager, etc. NEVER commit real values to a repo or plaintext file):
   NS_TOKEN_ID           — NetSuite OAuth token ID
   NS_TOKEN_SECRET       — NetSuite OAuth token secret
   ANTHROPIC_API_KEY     — Anthropic API key (for doc extraction)
-  SLACK_BOT_TOKEN       — Slack bot token
+  SLACK_BOT_TOKEN       — Slack bot token (needs chat:write AND files:write scopes)
   NS_RESTLET_URL        — (optional) NetSuite RESTlet URL for file uploads
 
-Status label IDs (confirmed 2026-04-07): Done=1, Error=2, Docs Uploaded=4
+Status label IDs (confirmed 2026-04-07): Done=1, Error=2, Docs Uploaded=4, Missing Resale Cert=8
 """
 
 import os
@@ -65,6 +67,7 @@ log = logging.getLogger("shinesty_sync")
 MONDAY_BOARD_ID     = 18402152636
 SLACK_CHANNEL_ID    = "C0ARSBBPGP7"   # #whsl_multiple_address_alert
 SLACK_ALEX_USER_ID  = "U02H69DED2N"   # Alex — Wholesale Sales Ops Coordinator
+TAG_ALEX_IN_SLACK   = False           # set True to actually @-mention Alex; False while testing
 
 # Monday status label IDs
 STATUS_DONE                = 1   # "Done" — NS record created; triggers this script
@@ -584,7 +587,7 @@ def claude_extract_addresses(file_bytes: bytes, ext: str) -> list:
 
 
 # ══════════════════════════════════════════════
-# SLACK HELPER
+# SLACK HELPERS
 # ══════════════════════════════════════════════
 
 def slack_post(message: str) -> None:
@@ -598,6 +601,41 @@ def slack_post(message: str) -> None:
     result = r.json()
     if not result.get("ok"):
         raise RuntimeError(f"Slack error: {result.get('error')}")
+
+
+def slack_upload_file(filename: str, file_bytes: bytes, initial_comment: str) -> None:
+    """Upload a file directly into the Slack channel (rather than posting a
+    link to it), using Slack's 3-step external upload flow."""
+    r1 = requests.post(
+        "https://slack.com/api/files.getUploadURLExternal",
+        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+        data={"filename": filename, "length": len(file_bytes)},
+        timeout=15,
+    )
+    r1.raise_for_status()
+    d1 = r1.json()
+    if not d1.get("ok"):
+        raise RuntimeError(f"Slack getUploadURLExternal error: {d1.get('error')}")
+    upload_url = d1["upload_url"]
+    file_id = d1["file_id"]
+
+    r2 = requests.post(upload_url, files={"file": (filename, file_bytes)}, timeout=60)
+    r2.raise_for_status()
+
+    r3 = requests.post(
+        "https://slack.com/api/files.completeUploadExternal",
+        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}", "Content-Type": "application/json"},
+        json={
+            "files": [{"id": file_id, "title": filename}],
+            "channel_id": SLACK_CHANNEL_ID,
+            "initial_comment": initial_comment,
+        },
+        timeout=30,
+    )
+    r3.raise_for_status()
+    d3 = r3.json()
+    if not d3.get("ok"):
+        raise RuntimeError(f"Slack completeUploadExternal error: {d3.get('error')}")
 
 
 # ══════════════════════════════════════════════
@@ -699,20 +737,28 @@ def process_item(item: dict) -> None:
                 ns_add_customer_addresses(customer_id, addresses)
                 for addr in addresses:
                     log.info(f"      Added: {addr.get('addr1')}, {addr.get('city')}, {addr.get('state')}")
+
+                ct = MEDIA_TYPES.get(f["ext"], "application/octet-stream")
+                ns_upload_file_via_restlet(customer_id, f["name"], fb, ct, "multiple_address")
+
                 addr_lines = "\n".join(
                     f"  • {a.get('label','')}: {a.get('addr1','')} {a.get('addr2','').strip()}, "
                     f"{a.get('city','')}, {a.get('state','')} {a.get('zip','')}"
                     for a in addresses
                 )
-                slack_post(
-                    f"<@{SLACK_ALEX_USER_ID}> — Multiple addresses added to a customer record.\n\n"
-                    f"*Customer:* {company_name}\n"
-                    f"*NS Record:* {ns_link_url}\n"
-                    f"*Addresses added ({len(addresses)}):*\n{addr_lines}\n\n"
-                    f"*Original file:* {f['url']}\n"
-                    f"Please verify against the original file."
+                mention = f"<@{SLACK_ALEX_USER_ID}> — " if TAG_ALEX_IN_SLACK else ""
+                slack_upload_file(
+                    f["name"],
+                    fb,
+                    initial_comment=(
+                        f"{mention}Multiple addresses added to a customer record.\n\n"
+                        f"*Customer:* {company_name}\n"
+                        f"*NS Record:* {ns_link_url}\n"
+                        f"*Addresses added ({len(addresses)}):*\n{addr_lines}\n\n"
+                        f"Please verify against the attached file."
+                    ),
                 )
-                log.info("      Slack alert sent")
+                log.info("      Slack alert sent (file attached)")
             except Exception as e:
                 msg = f"Step 3 multi-address '{f['name']}': {e}"
                 log.error(f"      ERROR: {msg}")
