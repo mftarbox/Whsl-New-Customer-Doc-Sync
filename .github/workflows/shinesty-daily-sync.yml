@@ -1,15 +1,26 @@
 name: Shinesty Daily Sync
 
-# Runs 4x/day: ~8am, 11am, 2pm, 5pm US Eastern.
-# GitHub Actions cron is UTC-only, so times below are fixed UTC and will
-# drift by 1 hour across the DST changeover (mid-March / early November).
-# Adjust the four cron lines if your team is not on US Eastern time.
+# Runs 4x/day: 8am, 11am, 2pm, 5pm US Central. Uses the `timezone` field
+# (added to GitHub Actions in March 2026) so this is pinned to true local
+# Central time and does NOT drift across DST changeovers, unlike a fixed
+# UTC cron offset.
+#
+# Note: GitHub Actions scheduled workflows are not guaranteed to fire at
+# the exact scheduled time — GitHub can delay or, under high load, silently
+# skip a scheduled run entirely (documented GitHub Actions behavior, not a
+# bug in this workflow). See shinesty-daily-sync-watchdog.yml, which checks
+# shortly after each of these times and alerts in Slack if a run appears to
+# have been skipped.
 on:
   schedule:
-    - cron: "0 12 * * *"   # 8:00 AM ET  (EDT, UTC-4)
-    - cron: "0 15 * * *"   # 11:00 AM ET
-    - cron: "0 18 * * *"   # 2:00 PM ET
-    - cron: "0 21 * * *"   # 5:00 PM ET
+    - cron: "0 8 * * *"
+      timezone: "America/Chicago"
+    - cron: "0 11 * * *"
+      timezone: "America/Chicago"
+    - cron: "0 14 * * *"
+      timezone: "America/Chicago"
+    - cron: "0 17 * * *"
+      timezone: "America/Chicago"
   workflow_dispatch: {}     # lets you trigger a run manually from the Actions tab
 
 jobs:
