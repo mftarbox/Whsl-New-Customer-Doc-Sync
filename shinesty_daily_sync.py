@@ -67,7 +67,7 @@ log = logging.getLogger("shinesty_sync")
 MONDAY_BOARD_ID     = 18402152636
 SLACK_CHANNEL_ID    = "C0ARSBBPGP7"   # #whsl_multiple_address_alert
 SLACK_ALEX_USER_ID  = "U02H69DED2N"   # Alex — Wholesale Sales Ops Coordinator
-TAG_ALEX_IN_SLACK   = False           # set True to actually @-mention Alex; False while testing
+TAG_ALEX_IN_SLACK   = True           # set True to actually @-mention Alex; False while testing
 
 # Monday status label IDs
 STATUS_DONE                = 1   # "Done" — NS record created; triggers this script
