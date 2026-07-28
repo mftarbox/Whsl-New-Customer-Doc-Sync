@@ -14,7 +14,7 @@ What it does, per qualifying row:
                          → upload file to NS File Cabinet
   2. Signature file      → upload to NS File Cabinet
   3. Multiple Address    → extract addresses → add to NS customer record
-                         → Slack alert to #whsl_multiple_address_alert @Alex
+                         → Slack alert to #whsl_new_customer_alerts @Alex
   4. Status update:
        All steps OK  → Import NetSuite Status = "Docs Uploaded"
        Any error     → Import NetSuite Status = "Error" + post update on item
