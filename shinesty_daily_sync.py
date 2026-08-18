@@ -378,7 +378,14 @@ def ns_get_customer_id_from_link(ns_link: str) -> Optional[str]:
 def ns_update_customer_fields(customer_id: str, fields: dict) -> None:
     ns_patch(f"/customer/{customer_id}", fields)
 
-
+    # TEMPORARY DEBUG — remove once we've confirmed the actual NetSuite
+    # addressbook JSON shape. Logs the raw structure so we can see exactly
+    # how "defaultBilling" and "state" come back, instead of guessing.
+    if ns_customer_record:
+        log.info(f"    DEBUG addressbook: {json.dumps(ns_customer_record.get('addressbook'), indent=2)[:3000]}")
+    else:
+        log.info("    DEBUG addressbook: ns_customer_record is empty/None")
+            
 def get_default_billing_state(ns_customer_record: Optional[dict]) -> Optional[str]:
     """Look up the 2-letter state code on the NetSuite customer's default
     billing address (the addressbook entry with defaultBilling=true), from an
