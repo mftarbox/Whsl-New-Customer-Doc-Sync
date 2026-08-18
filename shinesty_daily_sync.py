@@ -381,11 +381,16 @@ def ns_update_customer_fields(customer_id: str, fields: dict) -> None:
 
 def get_default_billing_state(ns_customer_record: Optional[dict]) -> Optional[str]:
     """Look up the 2-letter state code on the NetSuite customer's default
-    billing address (the addressbook entry with defaultBilling=true), from an
+    billing address (the addressBook entry with defaultBilling=true), from an
     already-fetched customer record (fetched with expandSubResources=true —
     see process_item()). This is deliberately NOT sourced from Monday's
     billing-address column, which stores a free-text formatted address string
     that's unreliable to parse a state out of.
+
+    NOTE: NetSuite's REST record API uses camelCase field names on this
+    sub-record — "addressBook" / "addressBookAddress" — NOT the lowercase
+    "addressbook" / "addressbookaddress" you might guess from other NetSuite
+    integration styles. Confirmed against a live customer record 2026-08-18.
 
     Returns None if there's no default billing address, no state on it, or no
     record was available at all (e.g. the earlier fetch failed) — callers
@@ -394,9 +399,9 @@ def get_default_billing_state(ns_customer_record: Optional[dict]) -> Optional[st
     """
     if not ns_customer_record:
         return None
-    for entry in (ns_customer_record.get("addressbook") or {}).get("items", []):
+    for entry in (ns_customer_record.get("addressBook") or {}).get("items", []):
         if entry.get("defaultBilling"):
-            addr = entry.get("addressbookaddress") or {}
+            addr = entry.get("addressBookAddress") or {}
             state = addr.get("state")
             if isinstance(state, dict):
                 # in case "state" comes back as a list/ref field instead of a plain string
@@ -413,15 +418,18 @@ def ns_add_customer_addresses(customer_id: str, addresses: list, existing_record
     to fetching its own copy if none was successfully obtained upstream
     (existing_record is None or empty), so a failed earlier fetch can never
     result in PATCHing the address book down to just the newly-added entries.
+
+    Uses the same camelCase "addressBook" / "addressBookAddress" field names
+    as get_default_billing_state() — see that function's note.
     """
     record = existing_record if existing_record else ns_get(
         f"/customer/{customer_id}", params={"expandSubResources": "true"}
     )
-    addressbook = record.get("addressbook", {}).get("items", [])
+    addressbook = record.get("addressBook", {}).get("items", [])
 
     for address in addresses:
         addressbook.append({
-            "addressbookaddress": {
+            "addressBookAddress": {
                 "addr1":   address.get("addr1", ""),
                 "addr2":   address.get("addr2", ""),
                 "city":    address.get("city", ""),
@@ -434,7 +442,7 @@ def ns_add_customer_addresses(customer_id: str, addresses: list, existing_record
             "defaultBilling":  address.get("defaultBilling", False),
         })
 
-    ns_patch(f"/customer/{customer_id}", {"addressbook": {"items": addressbook}})
+    ns_patch(f"/customer/{customer_id}", {"addressBook": {"items": addressbook}})
 
 
 def ns_upload_file_via_restlet(customer_id: str, filename: str,
@@ -783,21 +791,6 @@ def process_item(item: dict) -> None:
         log.warning(f"  Could not fetch NetSuite customer record ({e}) — billing state check will treat "
                     f"cert as required; Step 3 will re-fetch its own copy if needed")
         ns_customer_record = None
-
-    # TEMPORARY DEBUG — remove once we've confirmed where NetSuite actually
-    # puts billing-address/state data for this record. addressbook came back
-    # null last run, so widen the net: dump every top-level key on the
-    # customer record plus the full value of any key that looks
-    # address/state/billing-related, instead of assuming it's addressbook.
-    if ns_customer_record:
-        log.info(f"    DEBUG customer record top-level keys: {sorted(ns_customer_record.keys())}")
-        relevant = {
-            k: v for k, v in ns_customer_record.items()
-            if any(s in k.lower() for s in ("addr", "state", "bill"))
-        }
-        log.info(f"    DEBUG address/state/bill fields: {json.dumps(relevant, indent=2)[:3000]}")
-    else:
-        log.info("    DEBUG: ns_customer_record is empty/None")
 
     billing_state = get_default_billing_state(ns_customer_record)
     cert_not_required = billing_state in STATES_NO_RESALE_CERT_REQUIRED
