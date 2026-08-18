@@ -378,14 +378,7 @@ def ns_get_customer_id_from_link(ns_link: str) -> Optional[str]:
 def ns_update_customer_fields(customer_id: str, fields: dict) -> None:
     ns_patch(f"/customer/{customer_id}", fields)
 
-    # TEMPORARY DEBUG — remove once we've confirmed the actual NetSuite
-    # addressbook JSON shape. Logs the raw structure so we can see exactly
-    # how "defaultBilling" and "state" come back, instead of guessing.
-    if ns_customer_record:
-        log.info(f"    DEBUG addressbook: {json.dumps(ns_customer_record.get('addressbook'), indent=2)[:3000]}")
-    else:
-        log.info("    DEBUG addressbook: ns_customer_record is empty/None")
-            
+
 def get_default_billing_state(ns_customer_record: Optional[dict]) -> Optional[str]:
     """Look up the 2-letter state code on the NetSuite customer's default
     billing address (the addressbook entry with defaultBilling=true), from an
@@ -791,13 +784,20 @@ def process_item(item: dict) -> None:
                     f"cert as required; Step 3 will re-fetch its own copy if needed")
         ns_customer_record = None
 
-    # TEMPORARY DEBUG — remove once we've confirmed the actual NetSuite
-    # addressbook JSON shape. Logs the raw structure so we can see exactly
-    # how "defaultBilling" and "state" come back, instead of guessing.
+    # TEMPORARY DEBUG — remove once we've confirmed where NetSuite actually
+    # puts billing-address/state data for this record. addressbook came back
+    # null last run, so widen the net: dump every top-level key on the
+    # customer record plus the full value of any key that looks
+    # address/state/billing-related, instead of assuming it's addressbook.
     if ns_customer_record:
-        log.info(f"    DEBUG addressbook: {json.dumps(ns_customer_record.get('addressbook'), indent=2)[:3000]}")
+        log.info(f"    DEBUG customer record top-level keys: {sorted(ns_customer_record.keys())}")
+        relevant = {
+            k: v for k, v in ns_customer_record.items()
+            if any(s in k.lower() for s in ("addr", "state", "bill"))
+        }
+        log.info(f"    DEBUG address/state/bill fields: {json.dumps(relevant, indent=2)[:3000]}")
     else:
-        log.info("    DEBUG addressbook: ns_customer_record is empty/None")
+        log.info("    DEBUG: ns_customer_record is empty/None")
 
     billing_state = get_default_billing_state(ns_customer_record)
     cert_not_required = billing_state in STATES_NO_RESALE_CERT_REQUIRED
@@ -938,7 +938,8 @@ def process_item(item: dict) -> None:
     else:
         set_monday_status(item_id, STATUS_DOCS_UPLOADED)
         log.info("  → DOCS UPLOADED ✓")
-            
+
+
 def download_file(url: str) -> bytes:
     r = requests.get(url, timeout=60)
     r.raise_for_status()
