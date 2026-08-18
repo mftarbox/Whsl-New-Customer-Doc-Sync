@@ -791,6 +791,14 @@ def process_item(item: dict) -> None:
                     f"cert as required; Step 3 will re-fetch its own copy if needed")
         ns_customer_record = None
 
+    # TEMPORARY DEBUG — remove once we've confirmed the actual NetSuite
+    # addressbook JSON shape. Logs the raw structure so we can see exactly
+    # how "defaultBilling" and "state" come back, instead of guessing.
+    if ns_customer_record:
+        log.info(f"    DEBUG addressbook: {json.dumps(ns_customer_record.get('addressbook'), indent=2)[:3000]}")
+    else:
+        log.info("    DEBUG addressbook: ns_customer_record is empty/None")
+
     billing_state = get_default_billing_state(ns_customer_record)
     cert_not_required = billing_state in STATES_NO_RESALE_CERT_REQUIRED
     if billing_state:
@@ -930,8 +938,7 @@ def process_item(item: dict) -> None:
     else:
         set_monday_status(item_id, STATUS_DOCS_UPLOADED)
         log.info("  → DOCS UPLOADED ✓")
-
-
+            
 def download_file(url: str) -> bytes:
     r = requests.get(url, timeout=60)
     r.raise_for_status()
