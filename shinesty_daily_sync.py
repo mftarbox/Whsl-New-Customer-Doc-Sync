@@ -239,7 +239,14 @@ def post_monday_update(item_id: str, message: str):
 # NETSUITE HELPERS  (OAuth 1.0 HMAC-SHA256)
 # ══════════════════════════════════════════════
 
-def _ns_oauth_header(method: str, url: str) -> str:
+def _ns_oauth_header(method: str, url: str, extra_params: dict = None) -> str:
+    """extra_params: any non-OAuth query-string parameters that will also be
+    sent on the request (e.g. {"expandSubResources": "true"}). OAuth 1.0a
+    requires ALL request parameters — not just the oauth_* ones — to be part
+    of the signature base string. Omitting them (as this function used to)
+    produces a signature NetSuite computes differently than the one it
+    receives, which surfaces as a generic 401 "Invalid login attempt" with no
+    hint that it's a signing issue rather than a credentials issue."""
     timestamp = str(int(time.time()))
     nonce     = hashlib.md5(f"{timestamp}{NS_TOKEN_ID}".encode()).hexdigest()
 
@@ -252,9 +259,13 @@ def _ns_oauth_header(method: str, url: str) -> str:
         "oauth_version":          "1.0",
     }
 
+    all_params = dict(oauth_params)
+    if extra_params:
+        all_params.update({k: str(v) for k, v in extra_params.items()})
+
     param_str = "&".join(
-        f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(v, safe='')}"
-        for k, v in sorted(oauth_params.items())
+        f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(str(v), safe='')}"
+        for k, v in sorted(all_params.items())
     )
 
     base = "&".join([
@@ -328,7 +339,7 @@ def _ns_base() -> str:
 def ns_get(path: str, params: dict = None) -> dict:
     base_url = f"{_ns_base()}/record/v1{path}"
     r = requests.get(base_url, params=params or {}, headers={
-        "Authorization": _ns_oauth_header("GET", base_url),
+        "Authorization": _ns_oauth_header("GET", base_url, extra_params=params),
         "Content-Type": "application/json",
     }, timeout=30)
     if not r.ok:
@@ -563,10 +574,71 @@ def claude_extract_resale_cert(file_bytes: bytes, ext: str) -> dict:
         '"resale_number": "<certificate or license number, or null>", '
         '"expiration_date": "<YYYY-MM-DD or null>"}'
     )
-    text = _claude([{"role": "user", "content": [
-        _file_block(file_bytes, ext),
-        {"type": "text", "text": prompt},
-    ]}], max_tokens=512)
+
+    # Claude's Messages API only accepts image/PDF file blocks (see
+    # MEDIA_TYPES / _file_block). Word docs, spreadsheets, and CSVs need their
+    # text extracted locally first and sent as plain text instead — the same
+    # approach claude_extract_addresses() already uses for the multi-address
+    # file. Without this, a .docx (or .xlsx/.xls/.csv) resale cert falls
+    # through to _file_block()'s "application/octet-stream" default and
+    # Claude's API rejects it outright with an opaque 400.
+    text_content = None
+    if ext == "docx":
+        try:
+            import io
+            from docx import Document
+            text_content = "\n".join(p.text for p in Document(io.BytesIO(file_bytes)).paragraphs)
+        except ImportError:
+            log.warning("python-docx not installed — sending as base64 (will likely 400)")
+        except Exception as e:
+            log.warning(f"docx read error: {e} — sending as base64 (will likely 400)")
+    elif ext in ("xlsx", "xls"):
+        try:
+            io_mod = __import__("io")
+            if ext == "xlsx":
+                import openpyxl
+                wb = openpyxl.load_workbook(io_mod.BytesIO(file_bytes), read_only=True)
+                rows = []
+                for ws in wb.worksheets:
+                    for row in ws.iter_rows(values_only=True):
+                        rows.append("\t".join("" if c is None else str(c) for c in row))
+                text_content = "\n".join(rows)
+            else:
+                try:
+                    import xlrd
+                    wb = xlrd.open_workbook(file_contents=file_bytes)
+                    rows = []
+                    for ws in wb.sheets():
+                        for i in range(ws.nrows):
+                            rows.append("\t".join(str(ws.cell_value(i, j)) for j in range(ws.ncols)))
+                    text_content = "\n".join(rows)
+                except ImportError:
+                    log.warning("xlrd not installed — install with: pip install xlrd")
+        except Exception as e:
+            log.warning(f"Excel read error: {e} — sending as base64 (will likely 400)")
+    elif ext == "csv":
+        text_content = file_bytes.decode("utf-8", errors="replace")
+    elif ext == "doc":
+        # Legacy binary .doc (pre-2007 Word format) — python-docx can only
+        # read modern .docx (OOXML). There's no library in requirements.txt
+        # for the old binary format, so fail with a clear, actionable message
+        # instead of letting it fall through to a confusing 400 from Claude.
+        raise ValueError(
+            "Resale cert was uploaded as a legacy .doc file (old binary Word format), "
+            "which this script can't read — only modern .docx is supported for Word "
+            "docs. Ask the rep to re-save/re-upload it as a PDF or .docx."
+        )
+
+    if text_content:
+        text = _claude(
+            [{"role": "user", "content": f"{prompt}\n\nDOCUMENT TEXT:\n{text_content}"}],
+            max_tokens=512,
+        )
+    else:
+        text = _claude([{"role": "user", "content": [
+            _file_block(file_bytes, ext),
+            {"type": "text", "text": prompt},
+        ]}], max_tokens=512)
     return json.loads(text)
 
 
