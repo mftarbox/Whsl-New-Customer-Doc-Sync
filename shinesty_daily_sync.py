@@ -12,15 +12,9 @@ FILTER: Process rows where Import NetSuite Status = Done (label 1)
 What it does, per qualifying row:
   1. Resale Certificate  → extract resale # + expiration → write to NS ONLY
                          → upload file to NS File Cabinet
-                         → SKIPPED ENTIRELY if the customer's NetSuite default
-                           billing address state is one that doesn't require a
-                           separate resale certificate (see
-                           STATES_NO_RESALE_CERT_REQUIRED below) — those items
-                           proceed straight to "Docs Uploaded" with no file
-                           required and no other automated action taken.
   2. Signature file      → upload to NS File Cabinet
   3. Multiple Address    → extract addresses → add to NS customer record
-                         → Slack alert to #whsl_new_customer_alerts @Alex
+                         → Slack alert to #whsl_multiple_address_alert @Alex
   4. Status update:
        All steps OK  → Import NetSuite Status = "Docs Uploaded"
        Any error     → Import NetSuite Status = "Error" + post update on item
@@ -69,7 +63,7 @@ log = logging.getLogger("shinesty_sync")
 # CONSTANTS
 # ──────────────────────────────────────────────
 MONDAY_BOARD_ID     = 18402152636
-SLACK_CHANNEL_ID    = "C0ARSBBPGP7"   # #whsl_multiple_address_alert
+SLACK_CHANNEL_ID    = "C0ARSBBPGP7"   # #whsl_new_customer_alerts (actual channel name — comment corrected 2026-07-28)
 SLACK_ALEX_USER_ID  = "U02H69DED2N"   # Alex — Wholesale Sales Ops Coordinator
 TAG_ALEX_IN_SLACK   = False           # set True to actually @-mention Alex; False while testing
 
@@ -86,15 +80,6 @@ COL_RESALE_FILE  = "upload_file__1"
 COL_SIGNATURE    = "signature__1"
 COL_MULTI_ADDR   = "upload_file6__1"
 COL_COMPANY_NAME = "short_text1__1"
-
-# States where a separate resale certificate document is not required — either
-# there's no state sales tax to exempt from, or (Mississippi) a sales tax
-# permit covers it instead of a distinct resale certificate document.
-# Confirmed with Shelly 2026-08-18. Checked against the state on the
-# customer's NetSuite default billing address (see get_default_billing_state),
-# NOT Monday's free-text billing address column — that field is a formatted
-# address string and unreliable to parse a state out of.
-STATES_NO_RESALE_CERT_REQUIRED = {"OR", "MT", "NH", "DE", "AK", "MS"}
 
 # ──────────────────────────────────────────────
 # ENV VARS
@@ -239,14 +224,7 @@ def post_monday_update(item_id: str, message: str):
 # NETSUITE HELPERS  (OAuth 1.0 HMAC-SHA256)
 # ══════════════════════════════════════════════
 
-def _ns_oauth_header(method: str, url: str, extra_params: dict = None) -> str:
-    """extra_params: any non-OAuth query-string parameters that will also be
-    sent on the request (e.g. {"expandSubResources": "true"}). OAuth 1.0a
-    requires ALL request parameters — not just the oauth_* ones — to be part
-    of the signature base string. Omitting them (as this function used to)
-    produces a signature NetSuite computes differently than the one it
-    receives, which surfaces as a generic 401 "Invalid login attempt" with no
-    hint that it's a signing issue rather than a credentials issue."""
+def _ns_oauth_header(method: str, url: str) -> str:
     timestamp = str(int(time.time()))
     nonce     = hashlib.md5(f"{timestamp}{NS_TOKEN_ID}".encode()).hexdigest()
 
@@ -259,13 +237,9 @@ def _ns_oauth_header(method: str, url: str, extra_params: dict = None) -> str:
         "oauth_version":          "1.0",
     }
 
-    all_params = dict(oauth_params)
-    if extra_params:
-        all_params.update({k: str(v) for k, v in extra_params.items()})
-
     param_str = "&".join(
-        f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(str(v), safe='')}"
-        for k, v in sorted(all_params.items())
+        f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(v, safe='')}"
+        for k, v in sorted(oauth_params.items())
     )
 
     base = "&".join([
@@ -339,7 +313,7 @@ def _ns_base() -> str:
 def ns_get(path: str, params: dict = None) -> dict:
     base_url = f"{_ns_base()}/record/v1{path}"
     r = requests.get(base_url, params=params or {}, headers={
-        "Authorization": _ns_oauth_header("GET", base_url, extra_params=params),
+        "Authorization": _ns_oauth_header("GET", base_url),
         "Content-Type": "application/json",
     }, timeout=30)
     if not r.ok:
@@ -379,57 +353,13 @@ def ns_update_customer_fields(customer_id: str, fields: dict) -> None:
     ns_patch(f"/customer/{customer_id}", fields)
 
 
-def get_default_billing_state(ns_customer_record: Optional[dict]) -> Optional[str]:
-    """Look up the 2-letter state code on the NetSuite customer's default
-    billing address (the addressBook entry with defaultBilling=true), from an
-    already-fetched customer record (fetched with expandSubResources=true —
-    see process_item()). This is deliberately NOT sourced from Monday's
-    billing-address column, which stores a free-text formatted address string
-    that's unreliable to parse a state out of.
-
-    NOTE: NetSuite's REST record API uses camelCase field names on this
-    sub-record — "addressBook" / "addressBookAddress" — NOT the lowercase
-    "addressbook" / "addressbookaddress" you might guess from other NetSuite
-    integration styles. Confirmed against a live customer record 2026-08-18.
-
-    Returns None if there's no default billing address, no state on it, or no
-    record was available at all (e.g. the earlier fetch failed) — callers
-    must treat None as NOT exempt (fail safe / resale cert still required),
-    never as an exemption.
-    """
-    if not ns_customer_record:
-        return None
-    for entry in (ns_customer_record.get("addressBook") or {}).get("items", []):
-        if entry.get("defaultBilling"):
-            addr = entry.get("addressBookAddress") or {}
-            state = addr.get("state")
-            if isinstance(state, dict):
-                # in case "state" comes back as a list/ref field instead of a plain string
-                state = state.get("refName") or state.get("id")
-            if state:
-                return str(state).strip().upper()
-    return None
-
-
-def ns_add_customer_addresses(customer_id: str, addresses: list, existing_record: dict = None) -> None:
-    """existing_record: pass an already-fetched customer record (fetched with
-    expandSubResources=true) to avoid a duplicate GET — e.g. the record
-    fetched earlier in process_item() for the billing-state check. Falls back
-    to fetching its own copy if none was successfully obtained upstream
-    (existing_record is None or empty), so a failed earlier fetch can never
-    result in PATCHing the address book down to just the newly-added entries.
-
-    Uses the same camelCase "addressBook" / "addressBookAddress" field names
-    as get_default_billing_state() — see that function's note.
-    """
-    record = existing_record if existing_record else ns_get(
-        f"/customer/{customer_id}", params={"expandSubResources": "true"}
-    )
-    addressbook = record.get("addressBook", {}).get("items", [])
+def ns_add_customer_addresses(customer_id: str, addresses: list) -> None:
+    record = ns_get(f"/customer/{customer_id}", params={"expandSubResources": "true"})
+    addressbook = record.get("addressbook", {}).get("items", [])
 
     for address in addresses:
         addressbook.append({
-            "addressBookAddress": {
+            "addressbookaddress": {
                 "addr1":   address.get("addr1", ""),
                 "addr2":   address.get("addr2", ""),
                 "city":    address.get("city", ""),
@@ -442,7 +372,7 @@ def ns_add_customer_addresses(customer_id: str, addresses: list, existing_record
             "defaultBilling":  address.get("defaultBilling", False),
         })
 
-    ns_patch(f"/customer/{customer_id}", {"addressBook": {"items": addressbook}})
+    ns_patch(f"/customer/{customer_id}", {"addressbook": {"items": addressbook}})
 
 
 def ns_upload_file_via_restlet(customer_id: str, filename: str,
@@ -582,71 +512,10 @@ def claude_extract_resale_cert(file_bytes: bytes, ext: str) -> dict:
         '"resale_number": "<certificate or license number, or null>", '
         '"expiration_date": "<YYYY-MM-DD or null>"}'
     )
-
-    # Claude's Messages API only accepts image/PDF file blocks (see
-    # MEDIA_TYPES / _file_block). Word docs, spreadsheets, and CSVs need their
-    # text extracted locally first and sent as plain text instead — the same
-    # approach claude_extract_addresses() already uses for the multi-address
-    # file. Without this, a .docx (or .xlsx/.xls/.csv) resale cert falls
-    # through to _file_block()'s "application/octet-stream" default and
-    # Claude's API rejects it outright with an opaque 400.
-    text_content = None
-    if ext == "docx":
-        try:
-            import io
-            from docx import Document
-            text_content = "\n".join(p.text for p in Document(io.BytesIO(file_bytes)).paragraphs)
-        except ImportError:
-            log.warning("python-docx not installed — sending as base64 (will likely 400)")
-        except Exception as e:
-            log.warning(f"docx read error: {e} — sending as base64 (will likely 400)")
-    elif ext in ("xlsx", "xls"):
-        try:
-            io_mod = __import__("io")
-            if ext == "xlsx":
-                import openpyxl
-                wb = openpyxl.load_workbook(io_mod.BytesIO(file_bytes), read_only=True)
-                rows = []
-                for ws in wb.worksheets:
-                    for row in ws.iter_rows(values_only=True):
-                        rows.append("\t".join("" if c is None else str(c) for c in row))
-                text_content = "\n".join(rows)
-            else:
-                try:
-                    import xlrd
-                    wb = xlrd.open_workbook(file_contents=file_bytes)
-                    rows = []
-                    for ws in wb.sheets():
-                        for i in range(ws.nrows):
-                            rows.append("\t".join(str(ws.cell_value(i, j)) for j in range(ws.ncols)))
-                    text_content = "\n".join(rows)
-                except ImportError:
-                    log.warning("xlrd not installed — install with: pip install xlrd")
-        except Exception as e:
-            log.warning(f"Excel read error: {e} — sending as base64 (will likely 400)")
-    elif ext == "csv":
-        text_content = file_bytes.decode("utf-8", errors="replace")
-    elif ext == "doc":
-        # Legacy binary .doc (pre-2007 Word format) — python-docx can only
-        # read modern .docx (OOXML). There's no library in requirements.txt
-        # for the old binary format, so fail with a clear, actionable message
-        # instead of letting it fall through to a confusing 400 from Claude.
-        raise ValueError(
-            "Resale cert was uploaded as a legacy .doc file (old binary Word format), "
-            "which this script can't read — only modern .docx is supported for Word "
-            "docs. Ask the rep to re-save/re-upload it as a PDF or .docx."
-        )
-
-    if text_content:
-        text = _claude(
-            [{"role": "user", "content": f"{prompt}\n\nDOCUMENT TEXT:\n{text_content}"}],
-            max_tokens=512,
-        )
-    else:
-        text = _claude([{"role": "user", "content": [
-            _file_block(file_bytes, ext),
-            {"type": "text", "text": prompt},
-        ]}], max_tokens=512)
+    text = _claude([{"role": "user", "content": [
+        _file_block(file_bytes, ext),
+        {"type": "text", "text": prompt},
+    ]}], max_tokens=512)
     return json.loads(text)
 
 
@@ -703,7 +572,7 @@ def claude_extract_addresses(file_bytes: bytes, ext: str) -> list:
             {"type": "text", "text": prompt},
         ]}]
 
-    return json.loads(_claude(messages, max_tokens=1024))
+    return json.loads(_claude(messages, max_tokens=4096))
 
 
 # ══════════════════════════════════════════════
@@ -782,73 +651,52 @@ def process_item(item: dict) -> None:
 
     company_name = get_col(item, COL_COMPANY_NAME).get("text", item_name).strip()
 
-    # Fetch the NetSuite customer record once (address book expanded) — shared
-    # between the billing-state exemption check below and Step 3's
-    # address-book update, so we don't make two identical GET calls per item.
-    try:
-        ns_customer_record = ns_get(f"/customer/{customer_id}", params={"expandSubResources": "true"})
-    except Exception as e:
-        log.warning(f"  Could not fetch NetSuite customer record ({e}) — billing state check will treat "
-                    f"cert as required; Step 3 will re-fetch its own copy if needed")
-        ns_customer_record = None
+    resale_files = get_file_urls(item, COL_RESALE_FILE)
+    if resale_files:
+        for f in resale_files:
+            try:
+                log.info(f"  [1] Resale cert: {f['name']}")
+                fb = download_file(f["url"])
+                fb, f["ext"], f["name"] = normalize_heic_file(fb, f["ext"], f["name"])
+                extracted = claude_extract_resale_cert(fb, f["ext"])
+                log.info(f"      Document type: {extracted.get('document_type')} | valid: {extracted.get('is_valid')}")
 
-    billing_state = get_default_billing_state(ns_customer_record)
-    cert_not_required = billing_state in STATES_NO_RESALE_CERT_REQUIRED
-    if billing_state:
-        log.info(f"  Billing state (NetSuite default billing address): {billing_state}"
-                 + (" (resale cert not required)" if cert_not_required else ""))
+                if not extracted.get("is_valid"):
+                    reject_reason = extracted.get("reject_reason") or f"Unacceptable document type: {extracted.get('document_type', 'unknown')}"
+                    msg = f"\"{f['name']}\" is not a valid resale certificate: {reject_reason}"
+                    log.error(f"      REJECTED: {reject_reason}")
+                    missing_cert_reasons.append(msg)
+                    continue
+
+                ns_fields = {}
+                if extracted.get("resale_number"):
+                    ns_fields["resalenumber"] = extracted["resale_number"]
+                if extracted.get("expiration_date"):
+                    ns_fields["custentity18"] = extracted["expiration_date"]
+                if ns_fields:
+                    ns_update_customer_fields(customer_id, ns_fields)
+                    log.info(f"      NS {customer_id} ← {ns_fields}")
+
+                    if ns_fields.get("resalenumber"):
+                        tax_fields = {
+                            "taxable": False,
+                            "taxitem": {"id": "462879"},
+                        }
+                        ns_update_customer_fields(customer_id, tax_fields)
+                        log.info(f"      NS {customer_id} ← tax exempt (taxable=False, taxitem=Shinesty Not Taxable [462879])")
+                else:
+                    log.info(f"      Valid cert but no number/expiry found to write")
+
+                ct = MEDIA_TYPES.get(f["ext"], "application/octet-stream")
+                ns_upload_file_via_restlet(customer_id, f["name"], fb, ct, "resale_cert")
+
+            except Exception as e:
+                msg = f"Step 1 resale cert '{f['name']}': {e}"
+                log.error(f"      ERROR: {msg}")
+                errors.append(msg)
     else:
-        log.warning("  Could not determine billing state from NetSuite — treating cert as required")
-
-    if cert_not_required:
-        log.info(f"  [1] Resale cert not required for billing state {billing_state} — skipping cert check")
-    else:
-        resale_files = get_file_urls(item, COL_RESALE_FILE)
-        if resale_files:
-            for f in resale_files:
-                try:
-                    log.info(f"  [1] Resale cert: {f['name']}")
-                    fb = download_file(f["url"])
-                    fb, f["ext"], f["name"] = normalize_heic_file(fb, f["ext"], f["name"])
-                    extracted = claude_extract_resale_cert(fb, f["ext"])
-                    log.info(f"      Document type: {extracted.get('document_type')} | valid: {extracted.get('is_valid')}")
-
-                    if not extracted.get("is_valid"):
-                        reject_reason = extracted.get("reject_reason") or f"Unacceptable document type: {extracted.get('document_type', 'unknown')}"
-                        msg = f"\"{f['name']}\" is not a valid resale certificate: {reject_reason}"
-                        log.error(f"      REJECTED: {reject_reason}")
-                        missing_cert_reasons.append(msg)
-                        continue
-
-                    ns_fields = {}
-                    if extracted.get("resale_number"):
-                        ns_fields["resalenumber"] = extracted["resale_number"]
-                    if extracted.get("expiration_date"):
-                        ns_fields["custentity18"] = extracted["expiration_date"]
-                    if ns_fields:
-                        ns_update_customer_fields(customer_id, ns_fields)
-                        log.info(f"      NS {customer_id} ← {ns_fields}")
-
-                        if ns_fields.get("resalenumber"):
-                            tax_fields = {
-                                "taxable": False,
-                                "taxitem": {"id": "462879"},
-                            }
-                            ns_update_customer_fields(customer_id, tax_fields)
-                            log.info(f"      NS {customer_id} ← tax exempt (taxable=False, taxitem=Shinesty Not Taxable [462879])")
-                    else:
-                        log.info(f"      Valid cert but no number/expiry found to write")
-
-                    ct = MEDIA_TYPES.get(f["ext"], "application/octet-stream")
-                    ns_upload_file_via_restlet(customer_id, f["name"], fb, ct, "resale_cert")
-
-                except Exception as e:
-                    msg = f"Step 1 resale cert '{f['name']}': {e}"
-                    log.error(f"      ERROR: {msg}")
-                    errors.append(msg)
-        else:
-            log.info("  [1] No resale certificate — skipping")
-            missing_cert_reasons.append("No resale certificate has been uploaded to this item.")
+        log.info("  [1] No resale certificate — skipping")
+        missing_cert_reasons.append("No resale certificate has been uploaded to this item.")
 
     sig_files = get_file_urls(item, COL_SIGNATURE)
     if sig_files:
@@ -875,7 +723,7 @@ def process_item(item: dict) -> None:
                 fb, f["ext"], f["name"] = normalize_heic_file(fb, f["ext"], f["name"])
                 addresses = claude_extract_addresses(fb, f["ext"])
                 log.info(f"      Extracted {len(addresses)} address(es)")
-                ns_add_customer_addresses(customer_id, addresses, existing_record=ns_customer_record)
+                ns_add_customer_addresses(customer_id, addresses)
                 for addr in addresses:
                     log.info(f"      Added: {addr.get('addr1')}, {addr.get('city')}, {addr.get('state')}")
 
