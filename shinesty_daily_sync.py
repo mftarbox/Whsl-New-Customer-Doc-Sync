@@ -14,7 +14,8 @@ What it does, per qualifying row:
                          → upload file to NS File Cabinet
   2. Signature file      → upload to NS File Cabinet
   3. Multiple Address    → extract addresses → add to NS customer record
-                         → Slack alert to #whsl_multiple_address_alert @Alex
+                         → To-do on Sales Ops L10 (ToDo group) assigned to Alex,
+                           with the address list + source file attached
   4. Status update:
        All steps OK  → Import NetSuite Status = "Docs Uploaded"
        Any error     → Import NetSuite Status = "Error" + post update on item
@@ -64,8 +65,13 @@ log = logging.getLogger("shinesty_sync")
 # ──────────────────────────────────────────────
 MONDAY_BOARD_ID     = 18402152636
 SLACK_CHANNEL_ID    = "C0ARSBBPGP7"   # #whsl_new_customer_alerts (actual channel name — comment corrected 2026-07-28)
-SLACK_ALEX_USER_ID  = "U02H69DED2N"   # Alex — Wholesale Sales Ops Coordinator
-TAG_ALEX_IN_SLACK   = False           # set True to actually @-mention Alex; False while testing
+
+# Multi-address to-do (changed 2026-10-07: replaces the Slack alert to Alex)
+SALES_OPS_L10_BOARD_ID = 7017226460            # "Sales Ops L10"
+SALES_OPS_L10_GROUP_ID = "new_group72329__1"   # "ToDo"
+SALES_OPS_L10_PERSON   = "person"              # People column
+SALES_OPS_L10_DATE     = "date4"               # Date column (set to the day the to-do is created)
+ALEX_MONDAY_USER_ID    = 25198970              # Alexandria Stephenson
 
 # Monday status label IDs
 STATUS_DONE                = 1   # "Done" — NS record created; triggers this script
@@ -211,13 +217,79 @@ def set_monday_status(item_id: str, label_id: int):
     })
 
 
-def post_monday_update(item_id: str, message: str):
+def post_monday_update(item_id: str, message: str) -> str:
     mutation = """
     mutation ($itemId: ID!, $body: String!) {
       create_update(item_id: $itemId, body: $body) { id }
     }
     """
-    monday_gql(mutation, {"itemId": str(item_id), "body": message})
+    data = monday_gql(mutation, {"itemId": str(item_id), "body": message})
+    return data["create_update"]["id"]
+
+
+def monday_add_file_to_update(update_id: str, filename: str, file_bytes: bytes) -> None:
+    """Attach a file to a Monday update via the /v2/file multipart endpoint."""
+    query = (
+        "mutation ($updateId: ID!, $file: File!) "
+        "{ add_file_to_update(update_id: $updateId, file: $file) { id } }"
+    )
+    resp = requests.post(
+        "https://api.monday.com/v2/file",
+        headers={"Authorization": MONDAY_API_KEY, "API-Version": "2024-01"},
+        data={
+            "query": query,
+            "variables": json.dumps({"updateId": str(update_id)}),
+            "map": json.dumps({"file": "variables.file"}),  # Monday's documented form
+        },
+        files={"file": (filename, file_bytes)},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "errors" in data:
+        raise RuntimeError(f"Monday file upload error: {data['errors']}")
+
+
+def create_multi_address_todo(company_name: str, ns_link_url: str, source_item_id: str,
+                              addresses: list, filename: str, file_bytes: bytes) -> str:
+    """Create a to-do on Sales Ops L10 for Alex to verify the addresses that were
+    added to the NetSuite customer record, with the source file attached."""
+    columns = {
+        SALES_OPS_L10_PERSON: {"personsAndTeams": [{"id": ALEX_MONDAY_USER_ID, "kind": "person"}]},
+        SALES_OPS_L10_DATE: {"date": datetime.now().strftime("%Y-%m-%d")},
+    }
+    data = monday_gql(
+        """
+        mutation ($boardId: ID!, $groupId: String!, $name: String!, $cols: JSON!) {
+          create_item(board_id: $boardId, group_id: $groupId, item_name: $name, column_values: $cols) { id }
+        }
+        """,
+        {
+            "boardId": str(SALES_OPS_L10_BOARD_ID),
+            "groupId": SALES_OPS_L10_GROUP_ID,
+            "name": f"Verify multiple addresses – {company_name}",
+            "cols": json.dumps(columns),
+        },
+    )
+    todo_id = data["create_item"]["id"]
+
+    addr_lines = "<br>".join(
+        f"• <b>{a.get('label','')}</b>: "
+        f"{' '.join(x for x in (a.get('addr1','').strip(), a.get('addr2','').strip()) if x)}, "
+        f"{a.get('city','')}, {a.get('state','')} {a.get('zip','')}"
+        for a in addresses
+    )
+    source_url = f"https://shinesty-team.monday.com/boards/{MONDAY_BOARD_ID}/pulses/{source_item_id}"
+    body = (
+        f"Multiple addresses were added to a new customer record. Please verify them against the attached file.<br><br>"
+        f"<b>Customer:</b> {company_name}<br>"
+        f"<b>NetSuite:</b> <a href=\"{ns_link_url}\">Open customer record</a><br>"
+        f"<b>New customer item:</b> <a href=\"{source_url}\">MFT_New Customer Creation</a><br><br>"
+        f"<b>Addresses added ({len(addresses)}):</b><br>{addr_lines}"
+    )
+    update_id = post_monday_update(todo_id, body)
+    monday_add_file_to_update(update_id, filename, file_bytes)
+    return todo_id
 
 
 # ══════════════════════════════════════════════
@@ -738,24 +810,10 @@ def process_item(item: dict) -> None:
                 ct = MEDIA_TYPES.get(f["ext"], "application/octet-stream")
                 ns_upload_file_via_restlet(customer_id, f["name"], fb, ct, "multiple_address")
 
-                addr_lines = "\n".join(
-                    f"  • {a.get('label','')}: {a.get('addr1','')} {a.get('addr2','').strip()}, "
-                    f"{a.get('city','')}, {a.get('state','')} {a.get('zip','')}"
-                    for a in addresses
+                todo_id = create_multi_address_todo(
+                    company_name, ns_link_url, item_id, addresses, f["name"], fb,
                 )
-                mention = f"<@{SLACK_ALEX_USER_ID}> — " if TAG_ALEX_IN_SLACK else ""
-                slack_upload_file(
-                    f["name"],
-                    fb,
-                    initial_comment=(
-                        f"{mention}Multiple addresses added to a customer record.\n\n"
-                        f"*Customer:* {company_name}\n"
-                        f"*NS Record:* {ns_link_url}\n"
-                        f"*Addresses added ({len(addresses)}):*\n{addr_lines}\n\n"
-                        f"Please verify against the attached file."
-                    ),
-                )
-                log.info("      Slack alert sent (file attached)")
+                log.info(f"      Sales Ops L10 to-do {todo_id} created for Alex (file attached)")
             except Exception as e:
                 msg = f"Step 3 multi-address '{f['name']}': {e}"
                 log.error(f"      ERROR: {msg}")
