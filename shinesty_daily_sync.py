@@ -87,6 +87,18 @@ COL_SIGNATURE    = "signature__1"
 COL_MULTI_ADDR   = "upload_file6__1"
 COL_COMPANY_NAME = "short_text1__1"
 
+# States where a separate resale certificate is NOT required (confirmed with
+# Shelly 2026-08-18). Customers whose NetSuite DEFAULT BILLING address is in
+# one of these states skip Step 1 entirely and are not flagged Missing Resale
+# Cert. MS has a sales tax permit requirement instead, but is treated as
+# exempt here per Shelly's explicit instruction.
+STATES_NO_RESALE_CERT_REQUIRED = {"OR", "MT", "NH", "DE", "AK", "MS"}
+
+US_STATE_NAMES = {
+    "OREGON": "OR", "MONTANA": "MT", "NEW HAMPSHIRE": "NH",
+    "DELAWARE": "DE", "ALASKA": "AK", "MISSISSIPPI": "MS",
+}
+
 # ──────────────────────────────────────────────
 # ENV VARS
 # ──────────────────────────────────────────────
@@ -433,13 +445,48 @@ def ns_update_customer_fields(customer_id: str, fields: dict) -> None:
     ns_patch(f"/customer/{customer_id}", fields)
 
 
-def ns_add_customer_addresses(customer_id: str, addresses: list) -> None:
-    record = ns_get(f"/customer/{customer_id}", params={"expandSubResources": "true"})
-    addressbook = record.get("addressbook", {}).get("items", [])
+def get_default_billing_state(ns_customer_record: Optional[dict]) -> Optional[str]:
+    """Return the 2-letter state of the customer's DEFAULT BILLING address from
+    the NetSuite customer record (fetched with expandSubResources=true).
 
+    NetSuite's REST API returns these fields in camelCase (addressBook /
+    addressBookAddress) — confirmed 2026-08-18 against a live record.
+
+    Fail-safe: returns None on anything ambiguous (no record, no default
+    billing entry, no state). None is always treated as NOT exempt."""
+    if not ns_customer_record:
+        return None
+    try:
+        for entry in ns_customer_record.get("addressBook", {}).get("items", []):
+            if not entry.get("defaultBilling"):
+                continue
+            addr = entry.get("addressBookAddress") or {}
+            state = addr.get("state")
+            if isinstance(state, dict):  # defensive: some fields come back as {id, refName}
+                state = state.get("id") or state.get("refName")
+            if not state:
+                return None
+            state = str(state).strip().upper()
+            state = US_STATE_NAMES.get(state, state)
+            return state if len(state) == 2 else None
+    except Exception as e:
+        log.warning(f"      Could not read default billing state: {e}")
+    return None
+
+
+def ns_add_customer_addresses(customer_id: str, addresses: list) -> None:
+    """Add extracted addresses to the customer's address book.
+
+    Uses camelCase addressBook/addressBookAddress (what NetSuite's REST API
+    actually uses — the old lowercase keys never matched). Only the NEW lines
+    are sent: a PATCH on a sublist without ?replace= adds lines rather than
+    replacing the whole sublist, so existing addresses are preserved without
+    having to echo them back (echoing back read-only fields like 'links' can
+    make the PATCH fail)."""
+    new_lines = []
     for address in addresses:
-        addressbook.append({
-            "addressbookaddress": {
+        new_lines.append({
+            "addressBookAddress": {
                 "addr1":   address.get("addr1", ""),
                 "addr2":   address.get("addr2", ""),
                 "city":    address.get("city", ""),
@@ -452,7 +499,8 @@ def ns_add_customer_addresses(customer_id: str, addresses: list) -> None:
             "defaultBilling":  address.get("defaultBilling", False),
         })
 
-    ns_patch(f"/customer/{customer_id}", {"addressbook": {"items": addressbook}})
+    if new_lines:
+        ns_patch(f"/customer/{customer_id}", {"addressBook": {"items": new_lines}})
 
 
 def ns_upload_file_via_restlet(customer_id: str, filename: str,
@@ -568,6 +616,42 @@ def _claude(messages: list, max_tokens: int = 512) -> str:
     raise RuntimeError("Claude API rate limit: max retries exceeded after 4 attempts (~5 min total wait)")
 
 
+def _extract_text_locally(file_bytes: bytes, ext: str) -> Optional[str]:
+    """Claude's API only accepts image/PDF file blocks. For Word/Excel/CSV,
+    pull the text out locally and send it as plain text instead."""
+    import io
+    if ext == "doc":
+        raise RuntimeError(
+            "Legacy .doc (pre-2007 Word) files can't be read — please re-upload "
+            "the resale certificate as a PDF, image, or .docx."
+        )
+    if ext == "docx":
+        from docx import Document
+        doc = Document(io.BytesIO(file_bytes))
+        parts = [p.text for p in doc.paragraphs]
+        for table in doc.tables:
+            for row in table.rows:
+                parts.append("\t".join(c.text for c in row.cells))
+        return "\n".join(parts)
+    if ext == "xlsx":
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
+        return "\n".join(
+            "\t".join("" if c is None else str(c) for c in row)
+            for ws in wb.worksheets for row in ws.iter_rows(values_only=True)
+        )
+    if ext == "xls":
+        import xlrd
+        wb = xlrd.open_workbook(file_contents=file_bytes)
+        return "\n".join(
+            "\t".join(str(ws.cell_value(i, j)) for j in range(ws.ncols))
+            for ws in wb.sheets() for i in range(ws.nrows)
+        )
+    if ext in ("csv", "txt"):
+        return file_bytes.decode("utf-8", errors="replace")
+    return None
+
+
 def claude_extract_resale_cert(file_bytes: bytes, ext: str) -> dict:
     prompt = (
         "You are reviewing a document uploaded to a wholesale resale certificate field. "
@@ -592,11 +676,15 @@ def claude_extract_resale_cert(file_bytes: bytes, ext: str) -> dict:
         '"resale_number": "<certificate or license number, or null>", '
         '"expiration_date": "<YYYY-MM-DD or null>"}'
     )
-    text = _claude([{"role": "user", "content": [
-        _file_block(file_bytes, ext),
-        {"type": "text", "text": prompt},
-    ]}], max_tokens=512)
-    return json.loads(text)
+    text_content = _extract_text_locally(file_bytes, ext)
+    if text_content is not None:
+        messages = [{"role": "user", "content": f"{prompt}\n\nDOCUMENT:\n{text_content}"}]
+    else:
+        messages = [{"role": "user", "content": [
+            _file_block(file_bytes, ext),
+            {"type": "text", "text": prompt},
+        ]}]
+    return json.loads(_claude(messages, max_tokens=512))
 
 
 def claude_extract_addresses(file_bytes: bytes, ext: str) -> list:
@@ -731,8 +819,26 @@ def process_item(item: dict) -> None:
 
     company_name = get_col(item, COL_COMPANY_NAME).get("text", item_name).strip()
 
+    # Look up the default billing state from NetSuite to decide whether a
+    # resale cert is required. Any failure → None → cert still required.
+    billing_state = None
+    try:
+        ns_record = ns_get(f"/customer/{customer_id}", params={"expandSubResources": "true"})
+        billing_state = get_default_billing_state(ns_record)
+    except Exception as e:
+        log.warning(f"  Could not fetch NS customer {customer_id} for billing state: {e}")
+
+    cert_exempt = billing_state in STATES_NO_RESALE_CERT_REQUIRED
+    if billing_state:
+        log.info(f"  Billing state (NetSuite default billing address): {billing_state}"
+                 + (" (resale cert not required)" if cert_exempt else ""))
+    else:
+        log.info("  Billing state: could not determine — resale cert required")
+
     resale_files = get_file_urls(item, COL_RESALE_FILE)
-    if resale_files:
+    if cert_exempt:
+        log.info(f"  [1] Resale cert not required for billing state {billing_state} — skipping cert check")
+    elif resale_files:
         for f in resale_files:
             try:
                 log.info(f"  [1] Resale cert: {f['name']}")
