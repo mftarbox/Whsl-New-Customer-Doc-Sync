@@ -16,7 +16,9 @@ What it does, per qualifying row:
   3. Multiple Address    → extract addresses → add to NS customer record
                          → To-do on Sales Ops L10 (ToDo group) assigned to Alex,
                            with the address list + source file attached
-  4. Status update:
+  4. Brand Shipping & Routing Guidelines → upload file(s) to NS File Cabinet
+                           (added 2026-10-20 — previously this column was ignored)
+  5. Status update:
        All steps OK  → Import NetSuite Status = "Docs Uploaded"
        Any error     → Import NetSuite Status = "Error" + post update on item
 
@@ -85,7 +87,19 @@ COL_NS_LINK      = "link_mm1j2zkk"
 COL_RESALE_FILE  = "upload_file__1"
 COL_SIGNATURE    = "signature__1"
 COL_MULTI_ADDR   = "upload_file6__1"
+COL_SR_GUIDELINES = "upload_file9__1"   # "Brand Shipping & Routing Guidelines" (added 2026-10-20)
 COL_COMPANY_NAME = "short_text1__1"
+
+# Content types used only for File Cabinet uploads (Step 4 can receive Word/Excel
+# docs that MEDIA_TYPES — which is scoped to what Claude accepts — doesn't cover).
+UPLOAD_MEDIA_TYPES = {
+    "doc":  "application/msword",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xls":  "application/vnd.ms-excel",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "csv":  "text/csv",
+    "txt":  "text/plain",
+}
 
 # States where a separate resale certificate is NOT required (confirmed with
 # Shelly 2026-08-18). Customers whose NetSuite DEFAULT BILLING address is in
@@ -159,6 +173,7 @@ def get_pending_items() -> list:
               "upload_file__1",
               "signature__1",
               "upload_file6__1",
+              "upload_file9__1",
               "short_text1__1"
             ]) {
               id
@@ -926,6 +941,27 @@ def process_item(item: dict) -> None:
                 errors.append(msg)
     else:
         log.info("  [3] No multiple address file — skipping")
+
+    # Step 4 (added 2026-10-20): Brand Shipping & Routing Guidelines. No
+    # extraction — just store every file in the customer's File Cabinet folder,
+    # same as the signature. Any file type is accepted (PDF, image, Word, etc.).
+    sr_files = get_file_urls(item, COL_SR_GUIDELINES)
+    if sr_files:
+        for f in sr_files:
+            try:
+                log.info(f"  [4] S&R guidelines: {f['name']}")
+                fb = download_file(f["url"])
+                fb, f["ext"], f["name"] = normalize_heic_file(fb, f["ext"], f["name"])
+                ct = (MEDIA_TYPES.get(f["ext"])
+                      or UPLOAD_MEDIA_TYPES.get(f["ext"])
+                      or "application/octet-stream")
+                ns_upload_file_via_restlet(customer_id, f["name"], fb, ct, "sr_guidelines")
+            except Exception as e:
+                msg = f"Step 4 S&R guidelines '{f['name']}': {e}"
+                log.error(f"      ERROR: {msg}")
+                errors.append(msg)
+    else:
+        log.info("  [4] No S&R guidelines file — skipping")
 
     if errors:
         note = (
