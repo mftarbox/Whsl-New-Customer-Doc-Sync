@@ -39,6 +39,17 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Added 2026-10-30: the S&R guidelines step (Step 4) converts Word/Excel/CSV
+      # uploads to PDF with LibreOffice before sending them to NetSuite (the
+      # NetSuite S&R LLM only reads PDFs). Without this, those items go to Error.
+      # Writer = Word/RTF, Calc = Excel/CSV, fonts-liberation = Arial/Times
+      # look-alikes so converted PDFs keep their layout. Adds ~1 min per run.
+      - name: Install LibreOffice (Word/Excel → PDF for S&R guidelines)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libreoffice-writer libreoffice-calc fonts-liberation
+          soffice --version
+
       - name: Run sync
         env:
           MONDAY_API_KEY: ${{ secrets.MONDAY_API_KEY }}
