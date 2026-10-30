@@ -21,7 +21,12 @@ on:
       timezone: "America/Chicago"
     - cron: "0 17 * * *"
       timezone: "America/Chicago"
-  workflow_dispatch: {}     # lets you trigger a run manually from the Actions tab
+  workflow_dispatch:        # lets you trigger a run manually from the Actions tab
+    inputs:
+      test_item_id:
+        description: "TEST ONLY: Monday item ID to process (ignores status, skips all other items). Leave blank for a normal run."
+        required: false
+        default: ""
 
 jobs:
   sync:
@@ -61,4 +66,5 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           NS_RESTLET_URL: ${{ secrets.NS_RESTLET_URL }}
+          TEST_ITEM_ID: ${{ github.event.inputs.test_item_id || '' }}
         run: python shinesty_daily_sync.py
