@@ -16,8 +16,17 @@ What it does, per qualifying row:
   3. Multiple Address    → extract addresses → add to NS customer record
                          → To-do on Sales Ops L10 (ToDo group) assigned to Alex,
                            with the address list + source file attached
-  4. Brand Shipping & Routing Guidelines → upload file(s) to NS File Cabinet
-                           (added 2026-10-20 — previously this column was ignored)
+  4. Brand Shipping & Routing Guidelines → convert to PDF → rename →
+                           upload to NS File Cabinet
+                           (added 2026-10-20; PDF-only + naming added 2026-10-30
+                           for the NetSuite LLM that summarizes S&R guides for the DC):
+                             • Only PDFs are uploaded. Images → PDF via Pillow;
+                               Word/Excel/CSV/etc. → PDF via LibreOffice (soffice).
+                               The original non-PDF file is NOT uploaded.
+                             • File name: "{Company} - SNR Guidelines.pdf"
+                               (numbered "... SNR Guidelines 1.pdf", "... 2.pdf" when
+                               there are several), plus " - ES" if the doc is Spanish.
+                             • Conversion failure → item goes to Error, nothing uploaded.
   5. Status update:
        All steps OK  → Import NetSuite Status = "Docs Uploaded"
        Any error     → Import NetSuite Status = "Error" + post update on item
@@ -90,16 +99,14 @@ COL_MULTI_ADDR   = "upload_file6__1"
 COL_SR_GUIDELINES = "upload_file9__1"   # "Brand Shipping & Routing Guidelines" (added 2026-10-20)
 COL_COMPANY_NAME = "short_text1__1"
 
-# Content types used only for File Cabinet uploads (Step 4 can receive Word/Excel
-# docs that MEDIA_TYPES — which is scoped to what Claude accepts — doesn't cover).
-UPLOAD_MEDIA_TYPES = {
-    "doc":  "application/msword",
-    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "xls":  "application/vnd.ms-excel",
-    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "csv":  "text/csv",
-    "txt":  "text/plain",
-}
+# Step 4 (S&R guidelines) — the NetSuite LLM that summarizes these for the DC
+# only reads PDFs and finds them by file name. Naming agreed 2026-10-30:
+#   "{Company} - SNR Guidelines[ N][ - ES].pdf"
+# ("SNR" rather than "S&R" to keep "&" out of File Cabinet URLs.)
+SR_NAME_LABEL     = "SNR Guidelines"
+SR_SPANISH_SUFFIX = " - ES"
+SOFFICE_BIN       = os.environ.get("SOFFICE_BIN", "soffice")  # LibreOffice, for Word/Excel → PDF
+IMAGE_EXTS        = {"png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "heic", "heif"}
 
 # States where a separate resale certificate is NOT required (confirmed with
 # Shelly 2026-08-18). Customers whose NetSuite DEFAULT BILLING address is in
@@ -149,7 +156,37 @@ def monday_gql(query: str, variables: dict = None) -> dict:
     return data["data"]
 
 
+SYNC_COLUMN_IDS = [
+    "status", "link_mm1j2zkk", "upload_file__1", "signature__1",
+    "upload_file6__1", "upload_file9__1", "short_text1__1",
+]
+
+# Test mode (added 2026-10-30): set TEST_ITEM_ID (the GitHub "Run workflow"
+# button exposes it as an input) to process ONLY that Monday item, whatever its
+# status. Needed because the NetSuite import automation on this board flips
+# incomplete test items to Error before the sync can see them on Done.
+# Blank on scheduled runs → normal behavior.
+TEST_ITEM_ID = os.environ.get("TEST_ITEM_ID", "").strip()
+
+
+def get_test_item(item_id: str) -> list:
+    data = monday_gql(
+        "query ($ids: [ID!]!, $cols: [String!]) { items(ids: $ids) { id name "
+        "column_values(ids: $cols) { id text value } } }",
+        {"ids": [item_id], "cols": SYNC_COLUMN_IDS},
+    )
+    items = data.get("items") or []
+    if not items:
+        raise RuntimeError(f"TEST_ITEM_ID {item_id} not found on Monday")
+    if not get_col(items[0], "link_mm1j2zkk").get("text"):
+        raise RuntimeError(f"TEST_ITEM_ID {item_id} has no NS Customer Link")
+    log.info(f"TEST MODE — processing only item {item_id} ({items[0]['name']}), status ignored.")
+    return items
+
+
 def get_pending_items() -> list:
+    if TEST_ITEM_ID:
+        return get_test_item(TEST_ITEM_ID)
     query = """
     query ($boardId: ID!, $cursor: String) {
       boards(ids: [$boardId]) {
@@ -759,6 +796,87 @@ def claude_extract_addresses(file_bytes: bytes, ext: str) -> list:
 
 
 # ══════════════════════════════════════════════
+# S&R GUIDELINES HELPERS (Step 4)
+# ══════════════════════════════════════════════
+
+def convert_to_pdf(file_bytes: bytes, ext: str, filename: str) -> bytes:
+    """Return the file as PDF bytes. PDFs pass through; images are converted
+    with Pillow; everything else (Word, Excel, CSV, RTF, PowerPoint…) goes
+    through LibreOffice headless. Raises on failure — the caller turns that
+    into an Error status so a non-PDF never reaches NetSuite."""
+    import io
+    ext = (ext or "").lower()
+    if ext == "pdf" or file_bytes[:5] == b"%PDF-":
+        return file_bytes
+
+    if ext in IMAGE_EXTS:
+        from PIL import Image, ImageSequence
+        if ext in ("heic", "heif"):
+            import pillow_heif
+            pillow_heif.register_heif_opener()
+        img = Image.open(io.BytesIO(file_bytes))
+        pages = []
+        for p in ImageSequence.Iterator(img):  # multi-page TIFF → multi-page PDF
+            p = p.convert("RGBA")
+            bg = Image.new("RGB", p.size, (255, 255, 255))  # flatten transparency onto white, not black
+            bg.paste(p, mask=p.split()[3])
+            pages.append(bg)
+        out = io.BytesIO()
+        pages[0].save(out, format="PDF", save_all=True, append_images=pages[1:], resolution=150)
+        return out.getvalue()
+
+    import subprocess, tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, f"source.{ext or 'bin'}")
+        with open(src, "wb") as fh:
+            fh.write(file_bytes)
+        proc = subprocess.run(
+            [SOFFICE_BIN, "--headless", "--norestore", "--convert-to", "pdf", "--outdir", tmp, src],
+            capture_output=True, timeout=180,
+        )
+        pdf_path = os.path.join(tmp, "source.pdf")
+        if proc.returncode != 0 or not os.path.exists(pdf_path):
+            raise RuntimeError(
+                f"Could not convert '{filename}' to PDF "
+                f"(LibreOffice exit {proc.returncode}: {proc.stderr.decode(errors='replace')[:200]})"
+            )
+        with open(pdf_path, "rb") as fh:
+            return fh.read()
+
+
+def detect_spanish(pdf_bytes: bytes) -> bool:
+    """True if the document is primarily Spanish. Only used to add ' - ES' to
+    the file name, so any failure just logs and returns False (the NetSuite
+    LLM translates either way)."""
+    try:
+        answer = _claude([{"role": "user", "content": [
+            _file_block(pdf_bytes, "pdf"),
+            {"type": "text", "text": (
+                "What language is the main body of this document written in? "
+                "Reply with ONLY the two-letter ISO 639-1 code (e.g. en, es)."
+            )},
+        ]}], max_tokens=5)
+        return answer.strip().lower().startswith("es")
+    except Exception as e:
+        log.warning(f"      Language check failed ({e}) — naming as non-Spanish")
+        return False
+
+
+def build_sr_filename(company_name: str, index: Optional[int], spanish: bool) -> str:
+    """'{Company} - SNR Guidelines[ N][ - ES].pdf' with characters NetSuite's
+    File Cabinet rejects stripped out of the company name."""
+    company = (company_name or "").replace("&", " and ")  # keep "&" out of File Cabinet URLs
+    company = re.sub(r'[\\/:*?"<>|]+', " ", company).strip()
+    company = re.sub(r"\s+", " ", company) or "Customer"
+    name = f"{company} - {SR_NAME_LABEL}"
+    if index is not None:
+        name += f" {index}"
+    if spanish:
+        name += SR_SPANISH_SUFFIX
+    return f"{name}.pdf"
+
+
+# ══════════════════════════════════════════════
 # SLACK HELPER
 # ══════════════════════════════════════════════
 
@@ -942,20 +1060,21 @@ def process_item(item: dict) -> None:
     else:
         log.info("  [3] No multiple address file — skipping")
 
-    # Step 4 (added 2026-10-20): Brand Shipping & Routing Guidelines. No
-    # extraction — just store every file in the customer's File Cabinet folder,
-    # same as the signature. Any file type is accepted (PDF, image, Word, etc.).
+    # Step 4: Brand Shipping & Routing Guidelines → PDF only, renamed so the
+    # NetSuite S&R LLM can find them (see SR_NAME_LABEL). Original non-PDF
+    # files are not uploaded.
     sr_files = get_file_urls(item, COL_SR_GUIDELINES)
     if sr_files:
-        for f in sr_files:
+        multiple = len(sr_files) > 1
+        for n, f in enumerate(sr_files, start=1):
             try:
                 log.info(f"  [4] S&R guidelines: {f['name']}")
                 fb = download_file(f["url"])
-                fb, f["ext"], f["name"] = normalize_heic_file(fb, f["ext"], f["name"])
-                ct = (MEDIA_TYPES.get(f["ext"])
-                      or UPLOAD_MEDIA_TYPES.get(f["ext"])
-                      or "application/octet-stream")
-                ns_upload_file_via_restlet(customer_id, f["name"], fb, ct, "sr_guidelines")
+                pdf = convert_to_pdf(fb, f["ext"], f["name"])
+                spanish = detect_spanish(pdf)
+                ns_name = build_sr_filename(company_name, n if multiple else None, spanish)
+                log.info(f"      → {ns_name}" + (" (Spanish)" if spanish else ""))
+                ns_upload_file_via_restlet(customer_id, ns_name, pdf, "application/pdf", "sr_guidelines")
             except Exception as e:
                 msg = f"Step 4 S&R guidelines '{f['name']}': {e}"
                 log.error(f"      ERROR: {msg}")
